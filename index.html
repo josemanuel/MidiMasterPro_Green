@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>MIDI Master Pro v2</title>
+<title>MIDI Master Pro v4</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
 <style>
 /* ================================================================
@@ -489,7 +489,7 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
        ============================================================ -->
   <header class="glass-panel app-header">
     <div>
-      <div class="header-title">MIDI MASTER PRO <span style="font-size:.7rem;opacity:.6;">v2</span></div>
+      <div class="header-title">MIDI MASTER PRO <span style="font-size:.7rem;opacity:.6;">v4</span></div>
       <div class="header-sub">MIDI Analyzer · Professional Synthesizer · Recorder</div>
     </div>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -1655,7 +1655,11 @@ function bindUI(){
 // ================================================================
 
 // ---- Audio graph (uses shared _AC) ----
-// Chain: mixGains → driveGain → driveWS → filter → fxBus → [reverb|delay|chorus] → masterGain → compressor → destination
+// Chain: mixGains → driveGain → filter → fxBus → [reverb|delay|chorus] → masterGain → compressor → destination
+// NOTE: SM_driveWS (WaveShaper) eliminado del chain compartido.
+// Aplicar saturación no-lineal a la SUMA de voces polifónicas genera
+// distorsión por intermodulación. driveGain ahora conecta directo al filtro.
+// El knob Drive = solo pre-filter gain (lineal). Misma estrategia que Eurorack_OK.
 const SM_masterGain   = _AC.createGain();
 const SM_vcaGain      = _AC.createGain();   // kept but pass-through (gain=1)
 const SM_filter       = _AC.createBiquadFilter();
@@ -1678,8 +1682,10 @@ const SM_chorusLFO    = _AC.createOscillator();
 const SM_chorusLFOGain= _AC.createGain();
 // FX bus (pre-effects sum)
 const SM_fxBus        = _AC.createGain();
-// Master compressor/limiter
+// Master compressor — gentle peak control (Eurorack_OK: -18dB, 12:1)
 const SM_compressor   = _AC.createDynamicsCompressor();
+// Brick-wall limiter — hard safety net at -1dBFS (Eurorack_OK exact values)
+const SM_limiter      = _AC.createDynamicsCompressor();
 
 // ---- Initial values ----
 SM_masterGain.gain.value   = 0.7;   // slightly below 0.75 — 30% headroom as requested
@@ -1701,19 +1707,25 @@ SM_chorusDry.gain.value    = 1.0;
 SM_chorusLFO.type          = 'sine';
 SM_chorusLFO.frequency.value = 0.5;
 SM_chorusLFOGain.gain.value  = 0.003;
-// Compressor — transparent mastering limiter
-SM_compressor.threshold.setValueAtTime(-12, _AC.currentTime);
-SM_compressor.knee.setValueAtTime(30,       _AC.currentTime);
-SM_compressor.ratio.setValueAtTime(12,      _AC.currentTime);
-SM_compressor.attack.setValueAtTime(0.003,  _AC.currentTime);
-SM_compressor.release.setValueAtTime(0.25,  _AC.currentTime);
+// Compressor — Eurorack_OK exact values: gentle 12:1 at -18dB catches chord peaks
+SM_compressor.threshold.value = -18;
+SM_compressor.knee.value      = 10;
+SM_compressor.ratio.value     = 12;
+SM_compressor.attack.value    = 0.003;
+SM_compressor.release.value   = 0.25;
+// Limiter — brick-wall at -1dBFS (Eurorack_OK exact values)
+SM_limiter.threshold.value    = -1;
+SM_limiter.knee.value         = 0;
+SM_limiter.ratio.value        = 20;
+SM_limiter.attack.value       = 0.001;
+SM_limiter.release.value      = 0.05;
 // NOTE: SM_buildReverb() and SM_chorusLFO.start() are called from SM_initAudio()
 // because SM_S is declared later and SM_buildReverb reads SM_S.fx.reverbSize
 
 // ---- Wiring ----
 // Pre-FX chain
-SM_driveGain.connect(SM_driveWS);
-SM_driveWS.connect(SM_filter);
+// Wiring pre-FX: driveGain conecta DIRECTAMENTE al filter (sin driveWS)
+SM_driveGain.connect(SM_filter);
 SM_filter.connect(SM_fxBus);
 
 // Reverb branch
@@ -1741,9 +1753,10 @@ SM_chorusDelay.connect(SM_chorusWet);
 SM_chorusDry.connect(SM_masterGain);
 SM_chorusWet.connect(SM_masterGain);
 
-// Master: masterGain → compressor → destination
+// Master: masterGain → compressor → limiter → destination (Eurorack_OK chain)
 SM_masterGain.connect(SM_compressor);
-SM_compressor.connect(_AC.destination);
+SM_compressor.connect(SM_limiter);
+SM_limiter.connect(_AC.destination);
 
 const SM_mixG = {
   osc1:  _AC.createGain(), osc2:  _AC.createGain(),
@@ -1805,51 +1818,86 @@ async function SM_initAudio(){
 }
 
 // ---- NOTE ON / OFF ----
+// Architecture: per-voice sumBus → per-voice vcfFilt → per-voice vcaGain → SM_driveGain → shared FX
+// Identical to Eurorack_OK. NO shared filter automation — each voice owns its envelope.
 async function SM_noteOn(midiNote, velocity){
   await SM_initAudio();
   if(!SM_S.audioReady) return;
   if(SM_voices[midiNote]) SM_noteOff(midiNote);
+
   const vel = SM_S.velSens>0 ? (velocity/127)*SM_S.velSens+(1-SM_S.velSens) : 1;
   const now = _AC.currentTime;
   const voice = {};
 
-  // OSC 1
+  // ---- POLYPHONY SCALING: 1/sqrt(N) per voice (Eurorack_OK strategy) ----
+  // We do NOT rescale existing voices — compressor+limiter handle peaks.
+  const N         = Object.keys(SM_voices).length + 1;
+  const polyScale = 1.0 / Math.sqrt(Math.max(1, N));
+  voice.baseGain   = vel;
+  voice.scaledGain = vel * polyScale;
+
+  // ---- PER-VOICE VCA GAIN ----
+  const vcaGainNode = _AC.createGain();
+  vcaGainNode.gain.setValueAtTime(0.0001, now);
+  vcaGainNode.gain.linearRampToValueAtTime(vel * polyScale,             now + SM_S.vca.atk);
+  vcaGainNode.gain.linearRampToValueAtTime(vel * SM_S.vca.sus * polyScale, now + SM_S.vca.atk + SM_S.vca.dec);
+  voice.vcaGain = vcaGainNode;
+
+  // ---- PER-VOICE VCF FILTER ----
+  const vcfFilt = _AC.createBiquadFilter();
+  vcfFilt.type            = SM_S.vcf.type;
+  vcfFilt.frequency.value = SM_S.vcf.cutoff;
+  vcfFilt.Q.value         = SM_S.vcf.reso;
+  voice.vcfFilt = vcfFilt;
+  const baseCutoff = SM_S.vcf.cutoff;
+  const envRange   = baseCutoff * Math.abs(SM_S.vcf.envAmt) * 3 * (SM_S.vcf.envAmt < 0 ? -1 : 1);
+  vcfFilt.frequency.setValueAtTime(baseCutoff, now);
+  vcfFilt.frequency.linearRampToValueAtTime(
+    Math.max(20, Math.min(20000, baseCutoff + envRange)), now + SM_S.vcf.atk);
+  vcfFilt.frequency.linearRampToValueAtTime(
+    Math.max(20, Math.min(20000, baseCutoff + envRange * SM_S.vcf.sus)), now + SM_S.vcf.atk + SM_S.vcf.dec);
+
+  // ---- PER-VOICE SUMMING BUS ----
+  // sumBus → vcfFilt → vcaGainNode → SM_driveGain (shared FX chain)
+  const sumBus = _AC.createGain();
+  sumBus.gain.value = 1;
+  voice.sumBus = sumBus;
+  sumBus.connect(vcfFilt);
+  vcfFilt.connect(vcaGainNode);
+  vcaGainNode.connect(SM_driveGain);
+
+  // ---- OSC 1 ----
   if(!SM_S.osc[1].mute){
     const freq=SM_midiToFreq(midiNote+SM_S.osc[1].semi+SM_S.osc[1].oct*12);
     if(SM_S.osc[1].wave==='pwm'){voice.osc1=SM_makePWM(freq,SM_S.osc[1].pw,SM_S.osc[1].detune);}
     else{voice.osc1=_AC.createOscillator();voice.osc1.type=SM_S.osc[1].wave;voice.osc1.frequency.value=freq;voice.osc1.detune.value=SM_S.osc[1].detune;}
-    const g=_AC.createGain(); g.gain.value=SM_S.osc[1].level*vel*0.5; // ×0.5 polyphony headroom
-    voice.osc1.connect(g); g.connect(SM_mixG.osc1); voice.osc1.start(now); voice.g1=g;
+    const g=_AC.createGain();
+    g.gain.value = SM_S.osc[1].level * SM_mixG.osc1.gain.value;
+    voice.osc1.connect(g); g.connect(sumBus); voice.osc1.start(now); voice.g1=g;
   }
-  // OSC 2
+  // ---- OSC 2 ----
   if(!SM_S.osc[2].mute){
     const freq=SM_midiToFreq(midiNote+SM_S.osc[2].semi+SM_S.osc[2].oct*12);
     if(SM_S.osc[2].wave==='pwm'){voice.osc2=SM_makePWM(freq,SM_S.osc[2].pw,SM_S.osc[2].detune);}
     else{voice.osc2=_AC.createOscillator();voice.osc2.type=SM_S.osc[2].wave;voice.osc2.frequency.value=freq;voice.osc2.detune.value=SM_S.osc[2].detune;}
-    const g=_AC.createGain(); g.gain.value=SM_S.osc[2].level*vel*0.5; // ×0.5 polyphony headroom
-    voice.osc2.connect(g); g.connect(SM_mixG.osc2); voice.osc2.start(now); voice.g2=g;
+    const g=_AC.createGain();
+    g.gain.value = SM_S.osc[2].level * SM_mixG.osc2.gain.value;
+    voice.osc2.connect(g); g.connect(sumBus); voice.osc2.start(now); voice.g2=g;
   }
-  // Ring Mod
-  if(SM_S.ring.enabled&&voice.osc1&&voice.osc2){
+  // ---- NOISE per-voice tap ----
+  if(!SM_S.noise.mute && SM_S.noise.level>0){
+    const noiseTap=_AC.createGain(); noiseTap.gain.value=SM_S.noise.level;
+    SM_noiseGain.connect(noiseTap); noiseTap.connect(sumBus); voice.noiseTap=noiseTap;
+  }
+  // ---- RING MOD ----
+  if(SM_S.ring.enabled && voice.osc1 && voice.osc2){
     const rn=_AC.createGain(); rn.gain.value=0;
     if(SM_S.ring.src==='osc1xosc2') voice.osc2.connect(rn.gain); else SM_noiseGain.connect(rn.gain);
     (SM_S.ring.src==='osc1xosc2'?voice.osc1:voice.osc2).connect(rn);
     const rg=_AC.createGain(); rg.gain.value=SM_S.ring.amount;
-    rn.connect(rg); rg.connect(SM_mixG.ring); voice.ringNode=rn; voice.rg=rg;
+    rn.connect(rg); rg.connect(sumBus); voice.ringNode=rn; voice.rg=rg;
   }
-  // VCA envelope
-  const envRange=SM_S.vcf.cutoff*SM_S.vcf.envAmt*3;
-  SM_filter.frequency.cancelScheduledValues(now);
-  SM_filter.frequency.setValueAtTime(SM_filter.frequency.value,now);
-  SM_filter.frequency.linearRampToValueAtTime(Math.min(20000,SM_S.vcf.cutoff+envRange),now+SM_S.vcf.atk);
-  SM_filter.frequency.linearRampToValueAtTime(SM_S.vcf.cutoff+envRange*SM_S.vcf.sus,now+SM_S.vcf.atk+SM_S.vcf.dec);
-  // Apply gain ramp to osc gains
-  [voice.g1,voice.g2].filter(Boolean).forEach(g=>{
-    const base=g.gain.value;
-    g.gain.setValueAtTime(0.0001,now);
-    g.gain.linearRampToValueAtTime(base,now+SM_S.vca.atk);
-    g.gain.linearRampToValueAtTime(base*SM_S.vca.sus,now+SM_S.vca.atk+SM_S.vca.dec);
-  });
+
   SM_voices[midiNote]=voice;
   document.getElementById('synth-vc').textContent=Object.keys(SM_voices).length;
 }
@@ -1857,27 +1905,49 @@ async function SM_noteOn(midiNote, velocity){
 function SM_noteOff(midiNote){
   const v=SM_voices[midiNote]; if(!v) return;
   const now=_AC.currentTime, rel=SM_S.vca.rel;
-  SM_filter.frequency.cancelScheduledValues(now);
-  SM_filter.frequency.setValueAtTime(SM_filter.frequency.value,now);
-  SM_filter.frequency.linearRampToValueAtTime(SM_S.vcf.cutoff*0.2,now+SM_S.vcf.rel);
-  [v.g1,v.g2].filter(Boolean).forEach(g=>{
-    g.gain.cancelScheduledValues(now);g.gain.setValueAtTime(g.gain.value,now);g.gain.linearRampToValueAtTime(0.0001,now+rel);
-  });
-  [v.osc1,v.osc2].filter(Boolean).forEach(o=>{try{o.stop(now+rel+0.06);}catch(e){}});
+
+  // Mark as releasing so future rescaling won't interfere
+  v.releasing = true;
   delete SM_voices[midiNote];
   document.getElementById('synth-vc').textContent=Object.keys(SM_voices).length;
+
+  // Per-voice VCF release
+  if(v.vcfFilt){
+    v.vcfFilt.frequency.cancelScheduledValues(now);
+    v.vcfFilt.frequency.setValueAtTime(v.vcfFilt.frequency.value, now);
+    v.vcfFilt.frequency.linearRampToValueAtTime(Math.max(20, SM_S.vcf.cutoff*0.3), now+SM_S.vcf.rel);
+  }
+  // Per-voice VCA release
+  if(v.vcaGain){
+    const curVol = Math.max(0.0001, v.scaledGain || v.vcaGain.gain.value);
+    v.vcaGain.gain.cancelScheduledValues(now);
+    v.vcaGain.gain.setValueAtTime(curVol, now);
+    v.vcaGain.gain.exponentialRampToValueAtTime(0.0001, now+rel);
+  }
+  // Stop oscillators after release
+  [v.osc1,v.osc2].filter(Boolean).forEach(o=>{try{o.stop(now+rel+0.06);}catch(e){}});
+  // Disconnect nodes after release tail
+  setTimeout(()=>{
+    ['sumBus','vcfFilt','vcaGain','g1','g2','noiseTap','ringNode','rg'].forEach(k=>{
+      try{if(v[k])v[k].disconnect();}catch(e){}
+    });
+  }, (rel+0.3)*1000);
 }
 
 function SM_allNotesOff(){
   Object.keys(SM_voices).forEach(n=>SM_noteOff(+n));
   [...mmpState.activeKeys].forEach(n=>triggerNoteOff(n));
-  SM_filter.frequency.cancelScheduledValues(_AC.currentTime);
-  SM_filter.frequency.setValueAtTime(SM_S.vcf.cutoff,_AC.currentTime);
 }
 
 function SM_handleCC(cc,val){
-  if(cc===74){const norm=val/127;SM_S.vcf.cutoff=20*Math.pow(1000,norm);SM_filter.frequency.value=SM_S.vcf.cutoff;}
-  if(cc===71){SM_S.vcf.reso=val/127*20;SM_filter.Q.value=SM_S.vcf.reso;}
+  if(cc===74){
+    const norm=val/127; SM_S.vcf.cutoff=20*Math.pow(1000,norm);
+    Object.values(SM_voices).forEach(v=>{ if(v.vcfFilt) v.vcfFilt.frequency.value=SM_S.vcf.cutoff; });
+  }
+  if(cc===71){
+    SM_S.vcf.reso=val/127*20;
+    Object.values(SM_voices).forEach(v=>{ if(v.vcfFilt) v.vcfFilt.Q.value=SM_S.vcf.reso; });
+  }
 }
 
 // ---- Helpers ----
@@ -1893,8 +1963,17 @@ function SM_makePWM(freq,pw,detune){
 }
 
 function SM_makeSatCurve(d){
-  const n=256,c=new Float32Array(n),k=d*40;
-  for(let i=0;i<n;i++){const x=(i*2)/n-1;c[i]=(Math.PI+k)*x/(Math.PI+k*Math.abs(x));}
+  // NOTE: SM_driveWS ya no está en el chain principal (eliminado para evitar
+  // distorsión por intermodulación en polifonía). Esta función se conserva
+  // para uso futuro en saturación per-voz. Misma estrategia que Eurorack_OK.
+  const n=256,c=new Float32Array(n);
+  if(d<=1.0){
+    // Passthrough lineal perfecto cuando drive=1 — sin coloración
+    for(let i=0;i<n;i++) c[i]=(i*2)/n-1;
+  } else {
+    const k=(d-1)*40;
+    for(let i=0;i<n;i++){const x=(i*2)/n-1;c[i]=(Math.PI+k)*x/(Math.PI+k*Math.abs(x));}
+  }
   return c;
 }
 
@@ -1962,8 +2041,10 @@ function SM_setRingAmount(val){SM_S.ring.amount=parseFloat(val);document.getElem
 function SM_setFilterSlope(type,slope,el){
   SM_S.vcf.type=type; SM_S.vcf.slope=slope;
   document.querySelectorAll('.sm-slope-pill').forEach(p=>p.classList.remove('s'));
-  el.classList.add('s'); SM_filter.type=type;
-  if(slope===24) SM_filter.Q.value=Math.max(SM_S.vcf.reso,4); else SM_filter.Q.value=SM_S.vcf.reso;
+  el.classList.add('s');
+  // Update all active per-voice filters
+  const q = slope===24 ? Math.max(SM_S.vcf.reso,4) : SM_S.vcf.reso;
+  Object.values(SM_voices).forEach(v=>{ if(v.vcfFilt){ v.vcfFilt.type=type; v.vcfFilt.Q.value=q; } });
 }
 function SM_setVcfEnvAmt(val){SM_S.vcf.envAmt=parseFloat(val);const s=val>=0?'+':'';document.getElementById('sm-vcf-env-amt-val').textContent=s+Math.round(val*100)+'%';}
 function SM_setMasterVol(val){SM_S.masterVol=parseFloat(val);SM_masterGain.gain.value=parseFloat(val);document.getElementById('sm-master-vol-val').textContent=Math.round(val*100)+'%';}
@@ -2021,11 +2102,11 @@ function SM_setChorusMix(val){
   document.getElementById('sm-cho-wet-val').textContent=Math.round(w*100)+'%';
 }
 function SM_setCompThreshold(val){
-  SM_compressor.threshold.setTargetAtTime(parseFloat(val), _AC.currentTime, 0.02);
+  SM_compressor.threshold.value = parseFloat(val);
   document.getElementById('sm-comp-thr-val').textContent=val+'dB';
 }
 function SM_setCompRatio(val){
-  SM_compressor.ratio.setTargetAtTime(parseFloat(val), _AC.currentTime, 0.02);
+  SM_compressor.ratio.value = parseFloat(val);
   document.getElementById('sm-comp-ratio-val').textContent=val+':1';
 }
 
@@ -2129,10 +2210,17 @@ function SM_applyKnob(param,val){
   const P={
     'osc1det':v=>{SM_S.osc[1].detune=v;document.getElementById('sm-osc1-det-val').textContent=Math.round(v)+'¢';},
     'osc2det':v=>{SM_S.osc[2].detune=v;document.getElementById('sm-osc2-det-val').textContent=Math.round(v)+'¢';},
-    'vcfco':v=>{const f=20*Math.pow(1000,v);SM_S.vcf.cutoff=f;SM_filter.frequency.value=f;document.getElementById('sm-vcf-co-val').textContent=f>=1000?(f/1000).toFixed(1)+'kHz':Math.round(f)+'Hz';},
-    'vcfre':v=>{SM_S.vcf.reso=v;SM_filter.Q.value=v;document.getElementById('sm-vcf-re-val').textContent=v.toFixed(1);},
-    'vcfdr':v=>{SM_S.vcf.drive=v;SM_driveGain.gain.value=v;SM_driveWS.curve=SM_makeSatCurve(v);document.getElementById('sm-vcf-dr-val').textContent='×'+v.toFixed(1);},
-  };
+    'vcfco':v=>{
+      const f=20*Math.pow(1000,v); SM_S.vcf.cutoff=f;
+      Object.values(SM_voices).forEach(vx=>{ if(vx.vcfFilt) vx.vcfFilt.frequency.value=f; });
+      document.getElementById('sm-vcf-co-val').textContent=f>=1000?(f/1000).toFixed(1)+'kHz':Math.round(f)+'Hz';
+    },
+    'vcfre':v=>{
+      SM_S.vcf.reso=v;
+      Object.values(SM_voices).forEach(vx=>{ if(vx.vcfFilt) vx.vcfFilt.Q.value=v; });
+      document.getElementById('sm-vcf-re-val').textContent=v.toFixed(1);
+    },
+    'vcfdr':v=>{SM_S.vcf.drive=v;SM_driveGain.gain.value=v;SM_driveWS.curve=SM_makeSatCurve(v);document.getElementById('sm-vcf-dr-val').textContent='×'+v.toFixed(1);},  };
   if(P[param]) P[param](val);
 }
 
@@ -2311,7 +2399,7 @@ window.onload = function(){
     const lbl = document.getElementById('sm-comp-gr-val');
     function tick(){
       if(bar && SM_S.audioReady){
-        const gr = Math.abs(SM_compressor.reduction); // always positive dB reduction
+        const gr = Math.abs(SM_limiter.reduction); // reads from brick-wall limiter
         const pct = Math.min(100, gr * 4); // 25dB max → 100%
         bar.style.width = pct + '%';
         lbl.textContent = '-' + gr.toFixed(1) + 'dB GR';
